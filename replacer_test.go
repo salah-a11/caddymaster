@@ -12,452 +12,206 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package caddy
+package caddyhttp
 
 import (
-	"fmt"
-	"os"
-	"path/filepath"
-	"runtime"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
-func TestReplacer(t *testing.T) {
-	type testCase struct {
-		input, expect, empty string
+func TestHTTPVarReplacement(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "/foo/bar.tar.gz", nil)
+	repl := caddy.NewReplacer()
+	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl)
+	req = req.WithContext(ctx)
+	req.Host = "example.com:80"
+	req.RemoteAddr = "192.168.159.32:1234"
+
+	clientCert := []byte(`-----BEGIN CERTIFICATE-----
+MIIB9jCCAV+gAwIBAgIBAjANBgkqhkiG9w0BAQsFADAYMRYwFAYDVQQDDA1DYWRk
+eSBUZXN0IENBMB4XDTE4MDcyNDIxMzUwNVoXDTI4MDcyMTIxMzUwNVowHTEbMBkG
+A1UEAwwSY2xpZW50LmxvY2FsZG9tYWluMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCB
+iQKBgQDFDEpzF0ew68teT3xDzcUxVFaTII+jXH1ftHXxxP4BEYBU4q90qzeKFneF
+z83I0nC0WAQ45ZwHfhLMYHFzHPdxr6+jkvKPASf0J2v2HDJuTM1bHBbik5Ls5eq+
+fVZDP8o/VHKSBKxNs8Goc2NTsr5b07QTIpkRStQK+RJALk4x9QIDAQABo0swSTAJ
+BgNVHRMEAjAAMAsGA1UdDwQEAwIHgDAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8A
+AAEwEwYDVR0lBAwwCgYIKwYBBQUHAwIwDQYJKoZIhvcNAQELBQADgYEANSjz2Sk+
+eqp31wM9il1n+guTNyxJd+FzVAH+hCZE5K+tCgVDdVFUlDEHHbS/wqb2PSIoouLV
+3Q9fgDkiUod+uIK0IynzIKvw+Cjg+3nx6NQ0IM0zo8c7v398RzB4apbXKZyeeqUH
+9fNwfEi+OoXR6s+upSKobCmLGLGi9Na5s5g=
+-----END CERTIFICATE-----`)
+
+	block, _ := pem.Decode(clientCert)
+	if block == nil {
+		t.Fatalf("failed to decode PEM certificate")
 	}
 
-	rep := testReplacer()
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("failed to decode PEM certificate: %v", err)
+	}
 
-	// ReplaceAll
-	for i, tc := range []testCase{
+	req.TLS = &tls.ConnectionState{
+		Version:                    tls.VersionTLS13,
+		HandshakeComplete:          true,
+		ServerName:                 "example.com",
+		CipherSuite:                tls.TLS_AES_256_GCM_SHA384,
+		PeerCertificates:           []*x509.Certificate{cert},
+		NegotiatedProtocol:         "h2",
+		NegotiatedProtocolIsMutual: true,
+	}
+
+	res := httptest.NewRecorder()
+	addHTTPVarsToReplacer(repl, req, res)
+
+	for i, tc := range []struct {
+		get    string
+		expect string
+	}{
 		{
-			input:  "{",
-			expect: "{",
+			get:    "http.request.scheme",
+			expect: "https",
 		},
 		{
-			input:  `\{`,
-			expect: `{`,
+			get:    "http.request.method",
+			expect: http.MethodGet,
 		},
 		{
-			input:  "foo{",
-			expect: "foo{",
+			get:    "http.request.host",
+			expect: "example.com",
 		},
 		{
-			input:  `foo\{`,
-			expect: `foo{`,
+			get:    "http.request.port",
+			expect: "80",
 		},
 		{
-			input:  "foo{bar",
-			expect: "foo{bar",
+			get:    "http.request.hostport",
+			expect: "example.com:80",
 		},
 		{
-			input:  `foo\{bar`,
-			expect: `foo{bar`,
+			get:    "http.request.remote.host",
+			expect: "192.168.159.32",
 		},
 		{
-			input:  "foo{bar}",
-			expect: "foo",
+			get:    "http.request.remote.host/24",
+			expect: "192.168.159.0/24",
 		},
 		{
-			input:  `foo\{bar\}`,
-			expect: `foo{bar}`,
+			get:    "http.request.remote.host/24,32",
+			expect: "192.168.159.0/24",
 		},
 		{
-			input:  "}",
-			expect: "}",
-		},
-		{
-			input:  `\}`,
-			expect: `\}`,
-		},
-		{
-			input:  "{}",
+			get:    "http.request.remote.host/999",
 			expect: "",
 		},
 		{
-			input:  `\{\}`,
-			expect: `{}`,
+			get:    "http.request.remote.port",
+			expect: "1234",
 		},
 		{
-			input:  `{"json": "object"}`,
+			get:    "http.request.host.labels.0",
+			expect: "com",
+		},
+		{
+			get:    "http.request.host.labels.1",
+			expect: "example",
+		},
+		{
+			get:    "http.request.host.labels.2",
 			expect: "",
 		},
 		{
-			input:  `\{"json": "object"}`,
-			expect: `{"json": "object"}`,
+			get:    "http.request.uri.path.file",
+			expect: "bar.tar.gz",
 		},
 		{
-			input:  `\{"json": "object"\}`,
-			expect: `{"json": "object"}`,
+			get:    "http.request.uri.path.file.base",
+			expect: "bar.tar",
 		},
 		{
-			input:  `\{"json": "object{bar}"\}`,
-			expect: `{"json": "object"}`,
+			// not ideal, but also most correct, given that files can have dots (example: index.<SHA>.html) TODO: maybe this isn't right..
+			get:    "http.request.uri.path.file.ext",
+			expect: ".gz",
 		},
 		{
-			input:  `\{"json": \{"nested": "object"\}\}`,
-			expect: `{"json": {"nested": "object"}}`,
+			get:    "http.request.tls.cipher_suite",
+			expect: "TLS_AES_256_GCM_SHA384",
 		},
 		{
-			input:  `\{"json": \{"nested": "{bar}"\}\}`,
-			expect: `{"json": {"nested": ""}}`,
+			get:    "http.request.tls.proto",
+			expect: "h2",
 		},
 		{
-			input:  `pre \{"json": \{"nested": "{bar}"\}\}`,
-			expect: `pre {"json": {"nested": ""}}`,
+			get:    "http.request.tls.proto_mutual",
+			expect: "true",
 		},
 		{
-			input:  `\{"json": \{"nested": "{bar}"\}\} post`,
-			expect: `{"json": {"nested": ""}} post`,
+			get:    "http.request.tls.resumed",
+			expect: "false",
 		},
 		{
-			input:  `pre \{"json": \{"nested": "{bar}"\}\} post`,
-			expect: `pre {"json": {"nested": ""}} post`,
+			get:    "http.request.tls.server_name",
+			expect: "example.com",
 		},
 		{
-			input:  `{{`,
-			expect: "{{",
+			get:    "http.request.tls.version",
+			expect: "tls1.3",
 		},
 		{
-			input:  `{{}`,
+			get:    "http.request.tls.client.fingerprint",
+			expect: "9f57b7b497cceacc5459b76ac1c3afedbc12b300e728071f55f84168ff0f7702",
+		},
+		{
+			get:    "http.request.tls.client.issuer",
+			expect: "CN=Caddy Test CA",
+		},
+		{
+			get:    "http.request.tls.client.serial",
+			expect: "2",
+		},
+		{
+			get:    "http.request.tls.client.subject",
+			expect: "CN=client.localdomain",
+		},
+		{
+			get:    "http.request.tls.client.san.dns_names",
+			expect: "[localhost]",
+		},
+		{
+			get:    "http.request.tls.client.san.dns_names.0",
+			expect: "localhost",
+		},
+		{
+			get:    "http.request.tls.client.san.dns_names.1",
 			expect: "",
 		},
 		{
-			input:  `{"json": "object"\}`,
-			expect: "",
+			get:    "http.request.tls.client.san.ips",
+			expect: "[127.0.0.1]",
 		},
 		{
-			input:  `{unknown}`,
-			empty:  "-",
-			expect: "-",
+			get:    "http.request.tls.client.san.ips.0",
+			expect: "127.0.0.1",
 		},
 		{
-			input:  `back\slashes`,
-			expect: `back\slashes`,
-		},
-		{
-			input:  `double back\\slashes`,
-			expect: `double back\\slashes`,
-		},
-		{
-			input:  `placeholder {with \{ brace} in name`,
-			expect: `placeholder  in name`,
-		},
-		{
-			input:  `placeholder {with \} brace} in name`,
-			expect: `placeholder  in name`,
-		},
-		{
-			input:  `placeholder {with \} \} braces} in name`,
-			expect: `placeholder  in name`,
-		},
-		{
-			input:  `\{'group':'default','max_age':3600,'endpoints':[\{'url':'https://some.domain.local/a/d/g'\}],'include_subdomains':true\}`,
-			expect: `{'group':'default','max_age':3600,'endpoints':[{'url':'https://some.domain.local/a/d/g'}],'include_subdomains':true}`,
-		},
-		{
-			input:  `{}{}{}{\\\\}\\\\`,
-			expect: `{\\\}\\\\`,
-		},
-		{
-			input:  string([]byte{0x26, 0x00, 0x83, 0x7B, 0x84, 0x07, 0x5C, 0x7D, 0x84}),
-			expect: string([]byte{0x26, 0x00, 0x83, 0x7B, 0x84, 0x07, 0x7D, 0x84}),
+			get:    "http.request.tls.client.certificate_pem",
+			expect: string(clientCert) + "\n", // returned value comes with a newline appended to it
 		},
 	} {
-		actual := rep.ReplaceAll(tc.input, tc.empty)
+		actual, got := repl.GetString(tc.get)
+		if !got {
+			t.Errorf("Test %d: Expected to recognize the placeholder name, but didn't", i)
+		}
 		if actual != tc.expect {
-			t.Errorf("Test %d: '%s': expected '%s' but got '%s'",
-				i, tc.input, tc.expect, actual)
+			t.Errorf("Test %d: Expected %s to be '%s' but got '%s'",
+				i, tc.get, tc.expect, actual)
 		}
-	}
-}
-
-func TestReplacerSet(t *testing.T) {
-	rep := testReplacer()
-
-	for _, tc := range []struct {
-		variable string
-		value    any
-	}{
-		{
-			variable: "test1",
-			value:    "val1",
-		},
-		{
-			variable: "asdf",
-			value:    "123",
-		},
-		{
-			variable: "numbers",
-			value:    123.456,
-		},
-		{
-			variable: "äöü",
-			value:    "öö_äü",
-		},
-		{
-			variable: "with space",
-			value:    "space value",
-		},
-		{
-			variable: "1",
-			value:    "test-123",
-		},
-		{
-			variable: "mySuper_IP",
-			value:    "1.2.3.4",
-		},
-		{
-			variable: "testEmpty",
-			value:    "",
-		},
-	} {
-		rep.Set(tc.variable, tc.value)
-
-		// test if key is added
-		if val, ok := rep.static[tc.variable]; ok {
-			if val != tc.value {
-				t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
-			}
-		} else {
-			t.Errorf("Expected existing key '%s' found nothing", tc.variable)
-		}
-	}
-
-	// test if all keys are still there (by length)
-	length := len(rep.static)
-	if len(rep.static) != 8 {
-		t.Errorf("Expected length '%v' got '%v'", 7, length)
-	}
-}
-
-func TestReplacerReplaceKnown(t *testing.T) {
-	rep := Replacer{
-		providers: []ReplacerFunc{
-			// split our possible vars to two functions (to test if both functions are called)
-			func(key string) (val any, ok bool) {
-				switch key {
-				case "test1":
-					return "val1", true
-				case "asdf":
-					return "123", true
-				case "äöü":
-					return "öö_äü", true
-				case "with space":
-					return "space value", true
-				default:
-					return "NOOO", false
-				}
-			},
-			func(key string) (val any, ok bool) {
-				switch key {
-				case "1":
-					return "test-123", true
-				case "mySuper_IP":
-					return "1.2.3.4", true
-				case "testEmpty":
-					return "", true
-				default:
-					return "NOOO", false
-				}
-			},
-		},
-	}
-
-	for _, tc := range []struct {
-		testInput string
-		expected  string
-	}{
-		{
-			// test vars without space
-			testInput: "{test1}{asdf}{äöü}{1}{with space}{mySuper_IP}",
-			expected:  "val1123öö_äütest-123space value1.2.3.4",
-		},
-		{
-			// test vars with space
-			testInput: "{test1} {asdf} {äöü} {1} {with space} {mySuper_IP} ",
-			expected:  "val1 123 öö_äü test-123 space value 1.2.3.4 ",
-		},
-		{
-			// test with empty val
-			testInput: "{test1} {testEmpty} {asdf} {1} ",
-			expected:  "val1 EMPTY 123 test-123 ",
-		},
-		{
-			// test vars with not finished placeholders
-			testInput: "{te{test1}{as{{df{1}",
-			expected:  "{teval1{as{{dftest-123",
-		},
-		{
-			// test with non existing vars
-			testInput: "{test1} {nope} {1} ",
-			expected:  "val1 {nope} test-123 ",
-		},
-	} {
-		actual := rep.ReplaceKnown(tc.testInput, "EMPTY")
-
-		// test if all are replaced as expected
-		if actual != tc.expected {
-			t.Errorf("Expected '%s' got '%s' for '%s'", tc.expected, actual, tc.testInput)
-		}
-	}
-}
-
-func TestReplacerDelete(t *testing.T) {
-	rep := Replacer{
-		static: map[string]any{
-			"key1": "val1",
-			"key2": "val2",
-			"key3": "val3",
-			"key4": "val4",
-		},
-	}
-
-	startLen := len(rep.static)
-
-	toDel := []string{
-		"key2", "key4",
-	}
-
-	for _, key := range toDel {
-		rep.Delete(key)
-
-		// test if key is removed from static map
-		if _, ok := rep.static[key]; ok {
-			t.Errorf("Expected '%s' to be removed. It is still in static map.", key)
-		}
-	}
-
-	// check if static slice is smaller
-	expected := startLen - len(toDel)
-	actual := len(rep.static)
-	if len(rep.static) != expected {
-		t.Errorf("Expected length '%v' got length '%v'", expected, actual)
-	}
-}
-
-func TestReplacerMap(t *testing.T) {
-	rep := testReplacer()
-
-	for i, tc := range []ReplacerFunc{
-		func(key string) (val any, ok bool) {
-			return "", false
-		},
-		func(key string) (val any, ok bool) {
-			return "", false
-		},
-	} {
-		rep.Map(tc)
-
-		// test if function (which listens on specific key) is added by checking length
-		if len(rep.providers) == i+1 {
-			// check if the last function is the one we just added
-			pTc := fmt.Sprintf("%p", tc)
-			pRep := fmt.Sprintf("%p", rep.providers[i])
-			if pRep != pTc {
-				t.Errorf("Expected func pointer '%s' got '%s'", pTc, pRep)
-			}
-		} else {
-			t.Errorf("Expected providers length '%v' got length '%v'", i+1, len(rep.providers))
-		}
-	}
-}
-
-func TestReplacerNew(t *testing.T) {
-	rep := NewReplacer()
-
-	if len(rep.providers) != 2 {
-		t.Errorf("Expected providers length '%v' got length '%v'", 2, len(rep.providers))
-	} else {
-		// test if default global replacements are added  as the first provider
-		hostname, _ := os.Hostname()
-		wd, _ := os.Getwd()
-		os.Setenv("CADDY_REPLACER_TEST", "envtest")
-		defer os.Setenv("CADDY_REPLACER_TEST", "")
-
-		for _, tc := range []struct {
-			variable string
-			value    string
-		}{
-			{
-				variable: "system.hostname",
-				value:    hostname,
-			},
-			{
-				variable: "system.slash",
-				value:    string(filepath.Separator),
-			},
-			{
-				variable: "system.os",
-				value:    runtime.GOOS,
-			},
-			{
-				variable: "system.arch",
-				value:    runtime.GOARCH,
-			},
-			{
-				variable: "system.wd",
-				value:    wd,
-			},
-			{
-				variable: "env.CADDY_REPLACER_TEST",
-				value:    "envtest",
-			},
-		} {
-			if val, ok := rep.providers[0](tc.variable); ok {
-				if val != tc.value {
-					t.Errorf("Expected value '%s' for key '%s' got '%s'", tc.value, tc.variable, val)
-				}
-			} else {
-				t.Errorf("Expected key '%s' to be recognized by first provider", tc.variable)
-			}
-		}
-	}
-}
-
-func BenchmarkReplacer(b *testing.B) {
-	type testCase struct {
-		name, input, empty string
-	}
-
-	rep := testReplacer()
-	rep.Set("str", "a string")
-	rep.Set("int", 123.456)
-
-	for _, bm := range []testCase{
-		{
-			name:  "no placeholder",
-			input: `simple string`,
-		},
-		{
-			name:  "string replacement",
-			input: `str={str}`,
-		},
-		{
-			name:  "int replacement",
-			input: `int={int}`,
-		},
-		{
-			name:  "placeholder",
-			input: `{"json": "object"}`,
-		},
-		{
-			name:  "escaped placeholder",
-			input: `\{"json": \{"nested": "{bar}"\}\}`,
-		},
-	} {
-		b.Run(bm.name, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				rep.ReplaceAll(bm.input, bm.empty)
-			}
-		})
-	}
-}
-
-func testReplacer() Replacer {
-	return Replacer{
-		providers: make([]ReplacerFunc, 0),
-		static:    make(map[string]any),
 	}
 }
